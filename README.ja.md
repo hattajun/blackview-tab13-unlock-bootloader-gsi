@@ -14,8 +14,10 @@ Blackview Tab 13 のブートローダーをアンロックし、TrebleDroid の
 |---|---|
 | ブートローダーアンロック | 成功（`fastboot flashing unlock`） |
 | TrebleDroid Android 13 GSI | 起動成功 |
-| 動作確認 OK | Wi-Fi、カメラ、音、輝度変更、自動回転、タッチ、充電・バッテリー残量表示 |
-| 未確認 | Bluetooth、GPS、指紋・顔認証、SIM／モバイル通信、USB OTG、スリープ復帰、待機中の消費電力 |
+| Google アプリ（[7 章](#7-google-アプリの追加play-ストアyoutubegmailマップ)） | MindTheGapps を組み込むと動作: Google ログイン、Play ストア、YouTube、Gmail、マップ、Chrome のインストールと動作を確認。「端末が認定されていません」の警告は出なかった |
+| 動作確認 OK | Wi-Fi、Bluetooth、カメラ、音、輝度変更、自動回転、タッチ、充電・バッテリー残量表示 |
+| 怪しい | GPS（安定して動いていなさそう。未調査） |
+| 未確認 | 指紋・顔認証、SIM／モバイル通信、USB OTG、スリープ復帰、待機中の消費電力、銀行・決済アプリ、DRM 動画（アンロック状態のため動かない可能性が高い） |
 
 **最大のポイント:** GSI 導入時、定番の `fastboot --disable-verity --disable-verification flash vbmeta ...` を `vbmeta` / `vbmeta_system` / `vbmeta_vendor` の 3 つすべてに行うと、**GSI でもストックでも起動に失敗**しました（リカバリで "Can't load Android system"、理由 `init_user0_failed`）。メインの `vbmeta` だけに「hashtree 無効のみ（フラグ 1）」を設定すると起動しました。詳細は「5. 失敗と原因」を参照してください。
 
@@ -36,6 +38,7 @@ Blackview Tab 13 のブートローダーをアンロックし、TrebleDroid の
 3. fastboot でブートローダーをアンロックする
 4. GSI を書き込む（`vbmeta` のフラグに注意）
 5. 起動しなかった場合の復旧（`misc` 経由で fastbootd に入る）
+6. 任意: GSI イメージに MindTheGapps を組み込んで、Google アプリ（Play ストアなど）を追加する
 
 ## 0. 準備（PC 側）
 
@@ -296,21 +299,108 @@ for name in want:
                 b = f.read(min(left, 1 << 24)); o.write(b); left -= len(b)
 ```
 
-## 7. パーティション構成（`printgpt`）
+## 7. Google アプリの追加（Play ストア、YouTube、Gmail、マップ）
+
+### 7.1 なぜイメージの加工が必要か
+
+- TrebleDroid の `vanilla` GSI には、Google Mobile Services（GMS）が入っていません。
+- Google 公式の GMS 入り GSI もありますが、ライセンスはアプリの互換性テスト用に限られていて、改変・再配布が禁止されているため、日常使いには使いませんでした。
+- 一般的な「リカバリで GApps の zip を焼く」方法は使えません。この端末には TWRP がなく、`system` は `super`（動的パーティション）の中にあります。
+- そのため、PC 上で GSI の `system` イメージに、GApps をオフラインで組み込みました。
+
+### 7.2 入手元と検証
+
+**MindTheGapps 13.0.0 arm64** の `20231025_200931` を使いました。公式の GitLab プロジェクト（`gitlab.com/MindTheGapps/vendor_gapps`）が案内している、GitHub の組織のリリースです。公開者は LineageOS の開発者です。
+
+```bash
+B=https://github.com/MindTheGapps/13.0.0-arm64/releases/download/MindTheGapps-13.0.0-arm64-20231025_200931
+curl -L -O $B/MindTheGapps-13.0.0-arm64-20231025_200931.zip
+curl -L -O $B/release.x509.pem
+sha256sum MindTheGapps-13.0.0-arm64-20231025_200931.zip
+# 3ff2edaa75406eb4214402fca6906d4b413ab50afdb1af033d9e396992338d0b  （私が取得したもの）
+unzip -tq MindTheGapps-*.zip
+# zip の署名者と公開されている証明書の比較（同じ公開元なので、独立した検証ではなく、整合性の確認）
+unzip -p MindTheGapps-*.zip META-INF/CERT.RSA | openssl pkcs7 -inform DER -print_certs | openssl x509 -noout -fingerprint -sha256
+openssl x509 -in release.x509.pem -noout -fingerprint -sha256
+# どちらも: 91:37:0E:89:7E:35:BD:90:A2:62:B7:3E:82:96:66:18:19:C1:3D:54:67:FD:30:A1:0D:F8:48:DE:14:F5:67:76
+```
+
+zip の中身は、基本の Google アプリだけです（Play 開発者サービスの `GmsCore`、Play ストアの `Phonesky`、サービスフレームワーク、セットアップウィザード、Google アプリの `Velvet`、同期アダプターなど）。YouTube、Gmail、マップ、Chrome は、あとから Play ストアで入れます。
+
+> zip には、リカバリ向けのシェルスクリプト（`META-INF/com/google/android/update-binary`）が入っています。**これは実行していません。** 中身を読み（ファイルのコピーとパーミッション設定だけ）、同じ処理を自分で再現しました。
+
+### 7.3 ファイルを置く場所
+
+この GSI では、`/product` は `/system/product` への、`/system_ext` は `/system/system_ext` へのシンボリックリンクです。ストックの `product` パーティションは**マウントされていません**。そのため、zip の `system/product/...` と `system/system_ext/...` は、そのまま GSI の `system` イメージに入れれば有効になります（`adb shell ls -l /product` と `adb shell mount` で確認できます）。
+
+### 7.4 イメージの作成
+
+インストーラーの処理と、再現した内容は、次のとおりです。
+
+- ディレクトリは `0755 root:root`、ファイルは `0644 root:root`（`*.sh` と拡張子なしは `0755`）
+- 追加したものすべてに、SELinux ラベル `u:object_r:system_file:s0`（末尾に NUL を付けた `security.selinux`）
+- `SetupWizard` を入れる場合は、`system_ext/priv-app/Provision` を削除
+- `VelvetTitan`（379MB、tangorpro という機種専用）は除外
+
+障害が2つありました。
+
+1. GSI のイメージは、ext4 の **`shared_blocks`** 機能付き（重複排除された読み取り専用）で、そのままでは書き込めません。先に拡張して、「unshare」する必要があります。
+2. 3GiB に拡張しても、空きは約730MBです。`VelvetTitan` と `addon.d` を除いたペイロードは、約544MBです。
+
+```bash
+cp system-td-arm64-ab-vanilla.img system_gapps.img
+truncate -s 3G system_gapps.img
+e2fsck -fn system_gapps.img                       # クリーンであること
+resize2fs system_gapps.img                        # ファイルシステムを 3 GiB に拡張
+e2fsck -fy -E unshare_blocks system_gapps.img     # shared_blocks を解除
+
+mkdir payload && unzip -q -d payload MindTheGapps-*.zip 'system/*'
+rm -rf payload/system/product/priv-app/VelvetTitan payload/system/addon.d
+
+# debugfs のみ使用（マウントも sudo も不要）
+python3 scripts/embed_gapps.py system_gapps.img payload/system
+e2fsck -fn system_gapps.img                       # 引き続きクリーンであること
+```
+
+行った確認は、次のとおりです。`e2fsck` はクリーン。`Phonesky.apk`、`GmsCore.apk`、`GoogleServicesFramework.apk`、`google.xml`、`libjni_latinimegoogle.so` を `debugfs` で取り出して、zip の中身と一致することを確認。ラベルとパーミッションは上記のとおり。`Provision` は削除済み。既存のディレクトリ（例: `system_lib_file` の `product/lib64`）は、変更なし。
+
+### 7.5 書き込み
+
+```bash
+adb reboot fastboot
+fastboot resize-logical-partition system 3221225472   # 3 GiB。ストックの product/vendor はそのまま（合計約5.9GBで、7.3GBの super に収まる）
+fastboot flash system system_gapps.img
+fastboot erase userdata
+fastboot erase metadata
+fastboot reboot
+```
+
+この初回起動では、データを初期化します。Google の既定の実行時権限（`default-permissions-*.xml`）は、クリーンな初回起動で付与されます。ビルドのフィンガープリントは、今回変わらないためです。
+
+### 7.6 結果
+
+Google のセットアップウィザードが表示され、ログインでき、Play ストア経由で Play 開発者サービスが更新され、YouTube、Gmail、マップ、Chrome がインストールできて、動きました。「端末が認定されていません」という警告は、見ませんでした。未確認: Play Integrity に依存するアプリ（銀行・決済）、DRM 動画。
+
+起動しない場合は、4 章の素の GSI を書き込み直してください（4.2 の `vbmeta` の設定は、そのまま維持します）。
+
+## 8. パーティション構成（`printgpt`）
 
 `recovery`、`misc`、`para`、`expdb`、`frp`、`vbmeta`、`vbmeta_system`、`vbmeta_vendor`、`md_udc`、`metadata`、`nvcfg`、`nvdata`、`persist`、`protect1/2`、`seccfg`、`sec1`、`proinfo`、`boot_para`、`nvram`、`logo`、`md1img`、`spmfw`、`scp1/2`、`sspm_1/2`、`gz1/2`、`lk`、`lk2`、`boot`、`vendor_boot`、`dtbo`、`tee1/2`、`super`（`0x2c000000` から 7.3 GB）、`cache`、`userdata`、`otp`、`flashinfo`。
 
 `super` 内の論理パーティションは `system`、`vendor`、`product` の 3 つで、ストックのサイズは `system` = `0x72E12000`、`vendor` = `0x1E56F000`、`product` = `0x8182F000` でした。
 
-## 8. その他のメモ
+## 9. その他のメモ
 
 - 検索した範囲では、Tab 13 向けのカスタム ROM（LineageOS など）や TWRP の情報は見つかりませんでした。
 - 調査時の参考になった情報源: Hovatek フォーラムの Blackview 各機種のスレッド、mtkclient の README、TrebleDroid（phhusson）のリリース、Android 公式の GSI 解説。
 - ブートローダーを再ロックする場合の手順は、試していないため、本メモには含めていません。
 
-## 9. 未確認・今後の課題
+## 10. 未確認・今後の課題
 
-- Bluetooth、GPS、指紋・顔認証、SIM／モバイル通信（4G）、USB OTG、スリープ復帰、待機中の消費電力。
+- GPS が安定して動いていなさそう（未調査: GNSS の HAL / ベンダーのバイナリと GSI の相性、位置情報の設定）。
+- 指紋・顔認証、SIM／モバイル通信（4G）、USB OTG、スリープ復帰、待機中の消費電力。
+- アンロック状態の GSI での、銀行・決済アプリと DRM 動画。
+- OTA 更新はありません。更新するには、イメージを作り直して、7 章を繰り返します。
 - Magisk などによるルート化（`boot.img` へのパッチ）。
 - `vbmeta` のフラグ 1 がなぜ通るかの裏付け（推測のみ）。
 - 他の GSI（crDroid など）や、Android 14 以降の GSI の動作。

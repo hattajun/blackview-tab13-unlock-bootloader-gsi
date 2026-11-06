@@ -14,8 +14,10 @@ Notes on unlocking the bootloader of the **Blackview Tab 13** (MediaTek MT6768/M
 |---|---|
 | Bootloader unlock | Success (`fastboot flashing unlock`) |
 | TrebleDroid Android 13 GSI | Boots |
-| Verified working | Wi-Fi, cameras, audio, brightness, auto-rotate, touch, charging and battery level |
-| Not tested | Bluetooth, GPS, fingerprint/face unlock, SIM / mobile data, USB OTG, resume from sleep, idle battery drain |
+| Google apps (see [section 7](#7-adding-google-apps-play-store-youtube-gmail-maps)) | Works after embedding MindTheGapps: Google sign-in, Play Store, YouTube, Gmail, Maps, Chrome installed and running; no "device not certified" warning seen |
+| Verified working | Wi-Fi, Bluetooth, cameras, audio, brightness, auto-rotate, touch, charging and battery level |
+| Doubtful | GPS (does not look reliable; not investigated yet) |
+| Not tested | Fingerprint/face unlock, SIM / mobile data, USB OTG, resume from sleep, idle battery drain, banking/payment apps and DRM video (likely blocked by the unlocked bootloader) |
 
 **The key finding:** the usual GSI step `fastboot --disable-verity --disable-verification flash vbmeta ...` applied to all three of `vbmeta`, `vbmeta_system` and `vbmeta_vendor` made **both the GSI and the stock system fail to boot** (stock recovery: "Can't load Android system", reason `init_user0_failed`). Setting only the **main `vbmeta`** to "hashtree disabled only" (flags = 1) and leaving the other two stock booted fine. See [What went wrong](#5-what-went-wrong).
 
@@ -36,6 +38,7 @@ Notes on unlocking the bootloader of the **Blackview Tab 13** (MediaTek MT6768/M
 3. Unlock the bootloader with fastboot
 4. Flash the GSI (mind the `vbmeta` flags)
 5. If it does not boot: recover (reach fastbootd through `misc`)
+6. Optional: add Google apps (Play Store etc.) by embedding MindTheGapps into the GSI image
 
 Helper scripts are in [`scripts/`](scripts/).
 
@@ -237,21 +240,108 @@ In a reboot loop the Preloader window opens every cycle, so `mtk` can catch it.
 python3 scripts/lp_extract.py backup/super.bin stock_extract system vendor product
 ```
 
-## 7. Partition layout (`printgpt`)
+## 7. Adding Google apps (Play Store, YouTube, Gmail, Maps)
+
+### 7.1 Why it needs a custom image
+
+- The TrebleDroid `vanilla` GSI has no Google Mobile Services (GMS).
+- Google's own GSI with GMS exists, but its license only covers compatibility testing of apps (no modification or redistribution), so I did not use it for daily use.
+- The usual "flash a GApps zip in recovery" route is not available: there is no TWRP for this tablet, and `system` lives in `super` (dynamic partitions).
+- So GApps is embedded into the GSI `system` image offline, on the PC.
+
+### 7.2 Source and verification
+
+I used **MindTheGapps 13.0.0 arm64**, build `20231025_200931`, from the GitHub organisation that the official GitLab project (`gitlab.com/MindTheGapps/vendor_gapps`) points to. The release is published by a LineageOS developer.
+
+```bash
+B=https://github.com/MindTheGapps/13.0.0-arm64/releases/download/MindTheGapps-13.0.0-arm64-20231025_200931
+curl -L -O $B/MindTheGapps-13.0.0-arm64-20231025_200931.zip
+curl -L -O $B/release.x509.pem
+sha256sum MindTheGapps-13.0.0-arm64-20231025_200931.zip
+# 3ff2edaa75406eb4214402fca6906d4b413ab50afdb1af033d9e396992338d0b  (what I got)
+unzip -tq MindTheGapps-*.zip
+# signer vs. published certificate (same publisher, so this is a consistency check, not an independent one)
+unzip -p MindTheGapps-*.zip META-INF/CERT.RSA | openssl pkcs7 -inform DER -print_certs | openssl x509 -noout -fingerprint -sha256
+openssl x509 -in release.x509.pem -noout -fingerprint -sha256
+# both: 91:37:0E:89:7E:35:BD:90:A2:62:B7:3E:82:96:66:18:19:C1:3D:54:67:FD:30:A1:0D:F8:48:DE:14:F5:67:76
+```
+
+The zip contains the core Google apps only (Play services `GmsCore`, Play Store `Phonesky`, Services Framework, Setup Wizard, the Google app `Velvet`, sync adapters, and so on). YouTube, Gmail, Maps and Chrome come from the Play Store afterwards.
+
+> The zip ships a shell script (`META-INF/com/google/android/update-binary`) meant for a recovery. **I did not run it.** I read it (it only copies files and sets permissions) and reproduced its steps myself.
+
+### 7.3 Where the files have to go
+
+On this GSI, `/product` is a symlink to `/system/product` and `/system_ext` to `/system/system_ext`, and the stock `product` partition is **not mounted**. So the zip's `system/product/...` and `system/system_ext/...` trees go straight into the GSI `system` image (check with `adb shell ls -l /product` and `adb shell mount`).
+
+### 7.4 Building the image
+
+What the installer does, and what I reproduced:
+
+- directories `0755 root:root`, files `0644 root:root` (`0755` for `*.sh` and files without extension)
+- SELinux label `u:object_r:system_file:s0` (stored as `security.selinux` with a trailing NUL) on everything added
+- remove `system_ext/priv-app/Provision` when `SetupWizard` is installed
+- skip `VelvetTitan` (379 MB, only for the tangorpro device)
+
+Two obstacles:
+
+1. The GSI image has the ext4 **`shared_blocks`** feature (deduplicated, read-only), so it cannot be written as is. It has to be grown and "unshared" first.
+2. Only ~730 MB is free after growing to 3 GiB. The payload without `VelvetTitan` and `addon.d` is ~544 MB.
+
+```bash
+cp system-td-arm64-ab-vanilla.img system_gapps.img
+truncate -s 3G system_gapps.img
+e2fsck -fn system_gapps.img                       # must be clean
+resize2fs system_gapps.img                        # grow the filesystem to 3 GiB
+e2fsck -fy -E unshare_blocks system_gapps.img     # drop shared_blocks
+
+mkdir payload && unzip -q -d payload MindTheGapps-*.zip 'system/*'
+rm -rf payload/system/product/priv-app/VelvetTitan payload/system/addon.d
+
+# debugfs only, no mount, no sudo
+python3 scripts/embed_gapps.py system_gapps.img payload/system
+e2fsck -fn system_gapps.img                       # must still be clean
+```
+
+Quick checks I did: `e2fsck` clean; `Phonesky.apk`, `GmsCore.apk`, `GoogleServicesFramework.apk`, `google.xml` and `libjni_latinimegoogle.so` dumped back with `debugfs` and compared equal to the zip; labels and modes as above; `Provision` gone; existing directories (for example `product/lib64` with `system_lib_file`) left untouched.
+
+### 7.5 Flashing
+
+```bash
+adb reboot fastboot
+fastboot resize-logical-partition system 3221225472   # 3 GiB; the stock product/vendor stay (about 5.9 GB total in a 7.3 GB super)
+fastboot flash system system_gapps.img
+fastboot erase userdata
+fastboot erase metadata
+fastboot reboot
+```
+
+Wipe the data on this first boot: Google's default runtime-permission grants (`default-permissions-*.xml`) are applied on a clean first boot, and the build fingerprint does not change here.
+
+### 7.6 Result
+
+The Google Setup Wizard appeared, sign-in worked, Play services updated through the Play Store, and YouTube, Gmail, Maps and Chrome installed and ran. I did not see a "device is not certified" warning. Not verified: Play Integrity-dependent apps (banking, payments), DRM video.
+
+If it does not boot, flash the plain GSI from section 4 again (and keep the `vbmeta` setup from section 4.2).
+
+## 8. Partition layout (`printgpt`)
 
 `recovery`, `misc`, `para`, `expdb`, `frp`, `vbmeta`, `vbmeta_system`, `vbmeta_vendor`, `md_udc`, `metadata`, `nvcfg`, `nvdata`, `persist`, `protect1/2`, `seccfg`, `sec1`, `proinfo`, `boot_para`, `nvram`, `logo`, `md1img`, `spmfw`, `scp1/2`, `sspm_1/2`, `gz1/2`, `lk`, `lk2`, `boot`, `vendor_boot`, `dtbo`, `tee1/2`, `super` (7.3 GB at `0x2c000000`), `cache`, `userdata`, `otp`, `flashinfo`.
 
 Logical partitions in `super`: `system`, `vendor`, `product`. Stock sizes: `system` = `0x72E12000`, `vendor` = `0x1E56F000`, `product` = `0x8182F000`.
 
-## 8. Notes
+## 9. Notes
 
 - I found no custom ROM (LineageOS etc.) or TWRP reports for the Tab 13 in the searches I ran.
 - Useful sources: Hovatek forum threads for various Blackview devices, mtkclient's README, TrebleDroid (phhusson) releases, Android's GSI documentation.
 - I did not try re-locking the bootloader, so this log does not cover it.
 
-## 9. Open items
+## 10. Open items
 
-- Bluetooth, GPS, fingerprint/face unlock, SIM / mobile data, USB OTG, resume from sleep, idle battery drain.
+- GPS looks unreliable (not investigated: GNSS HAL / vendor blobs vs. GSI, location settings).
+- Fingerprint/face unlock, SIM / mobile data, USB OTG, resume from sleep, idle battery drain.
+- Banking/payment apps and DRM video on an unlocked bootloader with a GSI.
+- OTA-style updates: none. Updating means rebuilding the image and repeating section 7.
 - Rooting (patching `boot.img` with Magisk).
 - Why flags = 1 works and flags = 3 does not (only a guess so far).
 - Other GSIs (crDroid, etc.) and Android 14+ GSIs.
