@@ -1,0 +1,13 @@
+# Never commit device dumps: they contain device-unique data (IMEI, MAC, calibration, keys).
+backup/
+dumps/
+stock_extract/
+diag/
+*.bin
+*.img
+*.img.xz
+*.partial
+*.log
+venv/
+mtkclient/
+__pycache__/
